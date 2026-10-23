@@ -218,9 +218,12 @@ impl Acme {
         csr_pem: &str,
         on_challenge: impl AsyncFnOnce(Challenge) -> Result<()>,
     ) -> Result<Issued> {
-        let (Some(kid), Some(hmac)) = (&self.config.eab_kid, &self.config.eab_hmac_key) else {
-            bail!("ACME_EAB_KID and ACME_EAB_HMAC_KEY are required");
-        };
+        // EAB is optional: ZeroSSL requires it, Let's Encrypt does not.
+        let kid = self.config.eab_kid.as_deref();
+        let hmac = self.config.eab_hmac_key.as_deref();
+        if (kid.is_some()) != (hmac.is_some()) {
+            bail!("ACME_EAB_KID and ACME_EAB_HMAC_KEY must be set together");
+        }
         let Some(dns) = &self.dns else {
             bail!("CLOUDFLARE_ZONE_ID and CLOUDFLARE_API_TOKEN are required");
         };
@@ -251,12 +254,15 @@ impl Acme {
             kid: self.account.lock().await.clone(),
         };
         if session.kid.is_none() {
-            let binding = external_account_binding(&key, kid, hmac, &directory.new_account)?;
-            let payload = json!({
+            let mut payload = json!({
                 "contact": [format!("mailto:{}", self.config.email)],
                 "termsOfServiceAgreed": true,
-                "externalAccountBinding": binding,
             });
+            if let Some(binding) = kid.and_then(|kid| {
+                hmac.map(|hmac| external_account_binding(&key, kid, hmac, &directory.new_account))
+            }) {
+                payload["externalAccountBinding"] = binding?;
+            }
             let response = session.post(&directory.new_account, Some(&payload)).await?;
             let location = header(&response.headers, LOCATION)
                 .ok_or_else(|| anyhow!("ACME account has no location URL"))?;
