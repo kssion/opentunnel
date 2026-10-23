@@ -1,0 +1,4 @@
+# The upstream commit whose crates/opentunnel-server/src/store.rs this fork's SQLite store mirrors.
+# Run scripts/fork-sync-check.sh after fetching upstream; once the changes are reviewed (and the SQLite SQL and
+# SCHEMA_VERSION updated if needed), replace the hash below and commit it with the merge.
+synced-upstream: c23b162409425a800245245b445a4230f6346429
