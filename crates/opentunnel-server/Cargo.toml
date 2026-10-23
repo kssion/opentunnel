@@ -10,6 +10,11 @@ rust-version = "1.94"
 description = "The hosted OpenTunnel service: SNI routing, bridges, the HTTP API, and certificates"
 publish = false
 
+[features]
+# Fork only: replaces the whole `store` module with the SQLite backend in `src/fork/`. The default build is
+# upstream's MySQL store untouched, so merges from upstream stay trivial and can be checked without the feature.
+sqlite = ["sqlx/sqlite-bundled"]
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"

@@ -29,6 +29,12 @@ pub mod retry;
 pub mod server;
 pub mod service;
 pub mod sni;
+// Fork: with the `sqlite` feature the whole store module is replaced by the SQLite backend under `fork/`.
+// Without it this is upstream's MySQL store, byte for byte.
+#[cfg(not(feature = "sqlite"))]
+pub mod store;
+#[cfg(feature = "sqlite")]
+#[path = "fork/store.rs"]
 pub mod store;
 pub mod tls;
 pub mod website;
