@@ -1362,6 +1362,13 @@ impl Store {
         }
         Ok(deleted)
     }
+
+    /// Closes the pool and waits for the file's WAL checkpoint, so a test can reopen the same file.
+    #[cfg(test)]
+    async fn close_and_reopen(&self, url: &str) -> Self {
+        self.close().await;
+        Store::open(url).await.expect("reopening the test database")
+    }
 }
 
 /// A new database file for one test, in `TEST_SQLITE_DIR` (`/tmp` by default) so processes do not collide.
@@ -1374,4 +1381,597 @@ pub(crate) fn test_url() -> String {
         crate::crypto::uuid().replace('-', "")
     );
     format!("sqlite://{}", dir.join(name).display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::iso;
+    use opentunnel::protocol::api::TunnelState;
+
+    async fn store() -> Store {
+        crate::store::test_store().await.expect("a test database")
+    }
+
+    fn record(id: &str) -> StoredTunnel {
+        StoredTunnel {
+            version: 1,
+            id: id.into(),
+            hostname: format!("{id}.opentunnel.test"),
+            state: TunnelState::Offline,
+            certificate_id: None,
+            token_hash: "00ff".into(),
+            created_at: iso(1_800_000_000_000),
+            deleted_at: None,
+            certificate: None,
+            certificate_csr: None,
+            certificate_identifiers: None,
+            certificate_started_at: None,
+            last_connected_at: None,
+            renewal: None,
+        }
+    }
+
+    fn job(id: &str) -> Job {
+        Job {
+            certificate_id: id.into(),
+            tunnel_id: Some("abcdefghijkl".into()),
+            kind: JobKind::Issue,
+            identifiers: vec!["abcdefghijkl.opentunnel.test".into()],
+            csr: "CSR".into(),
+            attempts: 0,
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn only_sqlite_urls_are_accepted() {
+        assert!(connect_options("sqlite:///tmp/opentunnel.db").is_ok());
+        assert!(connect_options("sqlite::memory:").is_ok());
+        let error = connect_options("mysql://u:p@localhost/opentunnel").unwrap_err();
+        assert!(error.to_string().contains("SQLite"), "{error}");
+        assert!(connect_options("postgres://localhost/opentunnel").is_err());
+    }
+
+    #[tokio::test]
+    async fn migrates_repeatedly_and_refuses_a_newer_schema() {
+        let store = store().await;
+        // Migrating again is a no-op.
+        store.migrate().await.unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        sqlx::query("INSERT INTO schema_migrations (version, applied_at) VALUES (?, 0)")
+            .bind(SCHEMA_VERSION + 1)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let error = store.migrate().await.unwrap_err();
+        assert!(error.is::<NewerSchema>(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn startup_creates_the_file_and_gives_up_on_a_missing_directory() {
+        let url = test_url();
+        let store = Store::connect(&url, 4).unwrap();
+        store
+            .wait_ready(Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        store.put_tunnel(&record("abcdefghijkl"), 1).await.unwrap();
+
+        // A directory that does not exist cannot be created by SQLite; startup retries until the limit and then
+        // reports how long it waited, which is what the platform's restart policy keys on.
+        let missing = std::env::temp_dir().join(format!(
+            "opentunnel-missing-{}",
+            crate::crypto::uuid().replace('-', "")
+        ));
+        let store = Store::connect(&format!("sqlite://{}/x.db", missing.display()), 2).unwrap();
+        let error = store
+            .wait_ready(Some(Duration::from_millis(300)))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unreachable for"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_records_byte_for_byte_and_checks_revisions() {
+        let store = store().await;
+        let mut tunnel = record("abcdefghijkl");
+        tunnel.renewal = Some(crate::record::Renewal {
+            certificate_id: "cert_✓".into(),
+            started_at: iso(1),
+        });
+        assert_eq!(store.save_tunnel(&tunnel, 0, 1).await.unwrap(), 1);
+        assert!(
+            store
+                .save_tunnel(&tunnel, 0, 1)
+                .await
+                .unwrap_err()
+                .is::<Conflict>()
+        );
+        let loaded = store.tunnel("abcdefghijkl").await.unwrap().unwrap();
+        assert_eq!(loaded.revision, 1);
+        assert_eq!(
+            serde_json::to_string(&loaded.record).unwrap(),
+            serde_json::to_string(&tunnel).unwrap()
+        );
+        assert_eq!(store.issuing_tunnels().await.unwrap().len(), 1);
+        // IDs are case-sensitive, like MySQL's binary collation.
+        assert!(store.tunnel("ABCDEFGHIJKL").await.unwrap().is_none());
+
+        assert_eq!(store.save_tunnel(&tunnel, 1, 2).await.unwrap(), 2);
+        assert!(
+            store
+                .save_tunnel(&tunnel, 1, 3)
+                .await
+                .unwrap_err()
+                .is::<Conflict>()
+        );
+        tunnel.deleted_at = Some(iso(3));
+        store.save_tunnel(&tunnel, 2, 3).await.unwrap();
+        assert!(store.issuing_tunnels().await.unwrap().is_empty());
+        assert_eq!(store.counts().await.unwrap()["deleted"], 1);
+    }
+
+    #[tokio::test]
+    async fn imports_keep_local_changes_and_bump_revisions() {
+        let store = store().await;
+        let tunnel = record("abcdefghijkl");
+        let import = |force| store.import_tunnel(tunnel.clone(), Some(5), force, 1);
+        assert_eq!(import(false).await.unwrap(), ImportOutcome::Inserted);
+        assert_eq!(import(false).await.unwrap(), ImportOutcome::Unchanged);
+        assert_eq!(store.alarm("abcdefghijkl").await.unwrap(), Some(5));
+        let mut changed = tunnel.clone();
+        changed.state = TunnelState::Online;
+        assert_eq!(
+            store
+                .import_tunnel(changed.clone(), None, false, 2)
+                .await
+                .unwrap(),
+            ImportOutcome::Updated
+        );
+        let loaded = store.tunnel("abcdefghijkl").await.unwrap().unwrap();
+        assert_eq!(loaded.revision, 2);
+        store.save_tunnel(&loaded.record, 2, 3).await.unwrap();
+        assert_eq!(import(false).await.unwrap(), ImportOutcome::KeptLocal);
+        assert_eq!(import(true).await.unwrap(), ImportOutcome::Updated);
+
+        // Concurrent imports of new records all land once.
+        let imports = (0..8).map(|index| {
+            let store = store.clone();
+            async move {
+                store
+                    .import_tunnel(record(&format!("concurrent{index:02}")), None, false, 1)
+                    .await
+            }
+        });
+        for outcome in futures_util::future::join_all(imports).await {
+            assert_eq!(outcome.unwrap(), ImportOutcome::Inserted);
+        }
+
+        // Machines importing the same record at once (the pull-through on first use) insert it once.
+        let same = (0..8).map(|_| {
+            let store = store.clone();
+            async move {
+                store
+                    .import_tunnel(record("pulledthrugh"), Some(9), false, 1)
+                    .await
+            }
+        });
+        let mut outcomes: Vec<ImportOutcome> = futures_util::future::join_all(same)
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        outcomes.sort_by_key(|outcome| *outcome != ImportOutcome::Inserted);
+        assert_eq!(outcomes[0], ImportOutcome::Inserted);
+        assert!(
+            outcomes[1..]
+                .iter()
+                .all(|outcome| *outcome == ImportOutcome::Unchanged)
+        );
+        let loaded = store.tunnel("pulledthrugh").await.unwrap().unwrap();
+        assert_eq!(loaded.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn put_tunnel_replaces_records_and_bumps_revisions() {
+        let store = store().await;
+        store.put_tunnel(&record("abcdefghijkl"), 1).await.unwrap();
+        let mut changed = record("abcdefghijkl");
+        changed.state = TunnelState::Online;
+        store.put_tunnel(&changed, 2).await.unwrap();
+        let loaded = store.tunnel("abcdefghijkl").await.unwrap().unwrap();
+        assert_eq!(loaded.revision, 2);
+        assert_eq!(loaded.record.state, TunnelState::Online);
+    }
+
+    #[tokio::test]
+    async fn lists_deleted_tunnels() {
+        let store = store().await;
+        store.put_tunnel(&record("abcdefghijkl"), 1).await.unwrap();
+        let mut deleted = record("deletedtunnl");
+        deleted.deleted_at = Some(iso(1));
+        store.put_tunnel(&deleted, 1).await.unwrap();
+        assert_eq!(
+            store
+                .deleted_tunnels(&[
+                    "abcdefghijkl".into(),
+                    "deletedtunnl".into(),
+                    "unknown".into()
+                ])
+                .await
+                .unwrap(),
+            vec!["deletedtunnl".to_owned()]
+        );
+        assert!(store.deleted_tunnels(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_snapshots_read_the_record_and_alarm_at_once() {
+        let store = store().await;
+        let limit = Duration::from_secs(5);
+        assert!(
+            store
+                .attach_snapshot("abcdefghijkl", limit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.put_tunnel(&record("abcdefghijkl"), 1).await.unwrap();
+        let snapshot = store
+            .attach_snapshot("abcdefghijkl", limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.loaded.revision, 1);
+        assert_eq!(snapshot.loaded.record.id, "abcdefghijkl");
+        assert_eq!(snapshot.alarm, None);
+        store.set_alarm("abcdefghijkl", Some(77)).await.unwrap();
+        let snapshot = store
+            .attach_snapshot("abcdefghijkl", limit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.alarm, Some(77));
+        assert!(
+            store
+                .attach_snapshot("abc'def", limit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.tunnel("abc'def").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn alarm_scans_report_the_next_alarm() {
+        let store = store().await;
+        assert_eq!(
+            store.take_due_alarms_and_next(100).await.unwrap(),
+            (vec![], None)
+        );
+        for (id, at) in [
+            ("tunnel000001", 50),
+            ("tunnel000002", 300),
+            ("tunnel000003", 400),
+        ] {
+            store.put_tunnel(&record(id), 1).await.unwrap();
+            store.set_alarm(id, Some(at)).await.unwrap();
+        }
+        assert_eq!(
+            store.take_due_alarms_and_next(100).await.unwrap(),
+            (vec!["tunnel000001".to_owned()], Some(300))
+        );
+        assert_eq!(
+            store.take_due_alarms_and_next(100).await.unwrap(),
+            (vec![], Some(300))
+        );
+    }
+
+    #[tokio::test]
+    async fn alarms_fire_once_across_concurrent_callers() {
+        let store = store().await;
+        for index in 0..20 {
+            let id = format!("tunnel{index:06}");
+            store.put_tunnel(&record(&id), 1).await.unwrap();
+            store.set_alarm(&id, Some(100 + index)).await.unwrap();
+        }
+        let (first, second) = tokio::join!(store.take_due_alarms(200), store.take_due_alarms(200));
+        let mut taken = first.unwrap();
+        taken.extend(second.unwrap());
+        taken.sort();
+        taken.dedup();
+        assert_eq!(taken.len(), 20);
+        assert_eq!(store.next_alarm().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn jobs_are_leased_to_one_owner() {
+        let store = store().await;
+        assert!(store.add_job(job("cert_1"), 10).await.unwrap());
+        assert!(!store.add_job(job("cert_1"), 10).await.unwrap());
+        assert!(store.claim_due_jobs("a", 5, 10).await.unwrap().is_empty());
+
+        let (a, b) = tokio::join!(
+            store.claim_job("cert_1", "a", 20),
+            store.claim_job("cert_1", "b", 20)
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(
+            a.is_some() != b.is_some(),
+            "exactly one owner takes the job"
+        );
+        let (owner, other) = if a.is_some() { ("a", "b") } else { ("b", "a") };
+        assert!(
+            store
+                .claim_due_jobs(other, 20 + LEASE_MS - 1, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .finish_job("cert_1", other, "done", None, 30)
+                .await
+                .unwrap()
+        );
+        assert!(store.extend_lease("cert_1", owner, 1_000).await.unwrap());
+
+        let taken = store
+            .claim_due_jobs(other, 1_000 + LEASE_MS + 1, 10)
+            .await
+            .unwrap();
+        assert_eq!(taken.len(), 1);
+        assert!(
+            !store
+                .retry_job("cert_1", owner, 1, 0, "x".into(), 40)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .retry_job("cert_1", other, 1, 50, "x".into(), 40)
+                .await
+                .unwrap()
+        );
+        let retried = store.claim_due_jobs(owner, 60, 10).await.unwrap();
+        assert_eq!(retried[0].attempts, 1);
+        store.release_leases(owner).await.unwrap();
+        assert!(
+            store
+                .claim_job("cert_1", other, 61)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .finish_job("cert_1", other, "done", None, 70)
+                .await
+                .unwrap()
+        );
+        assert!(!store.job_pending("cert_1").await.unwrap());
+        assert!(store.job_exists("cert_1").await.unwrap());
+        assert_eq!(store.job_counts(0).await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn job_schedules_say_when_each_job_may_be_taken() {
+        let store = store().await;
+        assert!(store.job_schedule("a", 30, 10).await.unwrap().is_empty());
+        store.add_job(job("cert_due"), 10).await.unwrap();
+        store.add_job(job("cert_later"), 500).await.unwrap();
+        store.add_job(job("cert_leased"), 10).await.unwrap();
+        store
+            .claim_job("cert_leased", "b", 20)
+            .await
+            .unwrap()
+            .unwrap();
+        let issue = JobKind::Issue;
+        assert_eq!(
+            store.job_schedule("a", 30, 10).await.unwrap(),
+            [
+                ("cert_due".to_owned(), 10, issue),
+                ("cert_later".to_owned(), 500, issue),
+                ("cert_leased".to_owned(), 20 + LEASE_MS + 1, issue),
+            ]
+        );
+        assert_eq!(
+            store.job_schedule("b", 30, 2).await.unwrap(),
+            [
+                ("cert_due".to_owned(), 10, issue),
+                ("cert_leased".to_owned(), 10, issue)
+            ]
+        );
+        store
+            .add_job(
+                Job {
+                    kind: JobKind::Renew,
+                    ..job("cert_renew")
+                },
+                25,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.job_schedule("b", 30, 2).await.unwrap(),
+            [
+                ("cert_renew".to_owned(), 25, JobKind::Renew),
+                ("cert_due".to_owned(), 10, issue),
+            ]
+        );
+        assert_eq!(
+            store.job_schedule("a", 20, 10).await.unwrap()[..2],
+            [
+                ("cert_due".to_owned(), 10, issue),
+                ("cert_renew".to_owned(), 25, JobKind::Renew),
+            ]
+        );
+        store
+            .finish_job("cert_leased", "b", "done", None, 30)
+            .await
+            .unwrap();
+        assert_eq!(store.job_schedule("a", 30, 10).await.unwrap().len(), 3);
+        assert_eq!(store.pending_jobs().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn adds_the_rate_limits_table_to_a_database_at_this_version() {
+        let store = store().await;
+        sqlx::query("DROP TABLE rate_limits")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let rate = crate::limits::Rate {
+            interval_ms: 100,
+            tolerance_ms: 0,
+        };
+        assert_eq!(
+            store.take_rate("k", 1_000, rate).await.unwrap(),
+            crate::limits::Verdict::Allowed
+        );
+        store.migrate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rates_allow_a_burst_then_one_per_interval() {
+        let store = store().await;
+        let rate = crate::limits::Rate {
+            interval_ms: 100,
+            tolerance_ms: 200,
+        };
+        use crate::limits::Verdict::{Allowed, Limited};
+        for _ in 0..3 {
+            assert_eq!(store.take_rate("k", 1_000, rate).await.unwrap(), Allowed);
+        }
+        assert_eq!(
+            store.take_rate("k", 1_000, rate).await.unwrap(),
+            Limited {
+                retry_after_ms: 100
+            }
+        );
+        assert_eq!(
+            store.take_rate("k", 1_050, rate).await.unwrap(),
+            Limited { retry_after_ms: 50 }
+        );
+        assert_eq!(store.take_rate("k", 1_100, rate).await.unwrap(), Allowed);
+        assert!(matches!(
+            store.take_rate("k", 1_100, rate).await.unwrap(),
+            Limited { .. }
+        ));
+        assert_eq!(
+            store.take_rate("other", 1_100, rate).await.unwrap(),
+            Allowed
+        );
+        let results =
+            futures_util::future::join_all((0..10).map(|_| store.take_rate("new", 5_000, rate)))
+                .await;
+        let allowed = results
+            .into_iter()
+            .filter(|result| *result.as_ref().unwrap() == Allowed)
+            .count();
+        assert_eq!(allowed, 3);
+        assert_eq!(store.prune_rate_limits(1_401).await.unwrap(), 2);
+        assert!(matches!(
+            store.take_rate("new", 5_000, rate).await.unwrap(),
+            Limited { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_certificates_and_meta_are_set_once() {
+        let store = store().await;
+        let created = |key: &str| ServerCertificate {
+            private_key: key.into(),
+            csr: format!("csr-{key}"),
+            certificate: None,
+            chain: None,
+            expiry: None,
+        };
+        let first = store
+            .create_server_certificate("opentunnel.test", created("a"), 1)
+            .await
+            .unwrap();
+        let second = store
+            .create_server_certificate("opentunnel.test", created("b"), 1)
+            .await
+            .unwrap();
+        assert_eq!(first.private_key, "a");
+        assert_eq!(second.private_key, "a");
+        let stale = ServerCertificate {
+            certificate: Some("C".into()),
+            ..created("b")
+        };
+        store
+            .save_server_certificate("opentunnel.test", stale, 2)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .server_certificate("opentunnel.test")
+                .await
+                .unwrap()
+                .unwrap()
+                .certificate
+                .is_none()
+        );
+
+        assert!(store.swap_meta("k", None, "1").await.unwrap());
+        assert!(!store.swap_meta("k", None, "2").await.unwrap());
+        assert!(!store.swap_meta("k", Some("0"), "2").await.unwrap());
+        assert!(store.swap_meta("k", Some("1"), "2").await.unwrap());
+        assert_eq!(store.meta("k").await.unwrap().as_deref(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn export_pages_walk_the_table_in_id_order() {
+        let store = store().await;
+        for id in ["tunnel000001", "tunnel000002", "tunnel000003"] {
+            store.put_tunnel(&record(id), 1).await.unwrap();
+        }
+        store.set_alarm("tunnel000002", Some(9)).await.unwrap();
+        let first = store.export_page(None, 2).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|(id, _, alarm)| (id.as_str(), *alarm))
+                .collect::<Vec<_>>(),
+            [("tunnel000001", None), ("tunnel000002", Some(9))]
+        );
+        let after = first.last().unwrap().0.clone();
+        let second = store.export_page(Some(&after), 2).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0, "tunnel000003");
+    }
+
+    #[tokio::test]
+    async fn records_survive_reopening_the_file() {
+        let url = test_url();
+        let store = Store::open(&url).await.unwrap();
+        store.put_tunnel(&record("abcdefghijkl"), 1).await.unwrap();
+        store.set_alarm("abcdefghijkl", Some(5)).await.unwrap();
+        let store = store.close_and_reopen(&url).await;
+        let snapshot = store
+            .tunnel_with_alarm("abcdefghijkl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.loaded.revision, 1);
+        assert_eq!(snapshot.alarm, Some(5));
+        store.migrate().await.unwrap();
+    }
 }
