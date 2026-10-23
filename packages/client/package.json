@@ -1,6 +1,6 @@
 {
   "name": "@opentunnel/client",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "OpenTunnel SDK for Bun: expose local services through a blind TLS tunnel",
   "license": "MIT",
   "repository": {
@@ -35,13 +35,19 @@
   },
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json && tsc -p tsconfig.json --noEmit",
-    "test": "bun test"
+    "test": "bun test && node --test test/node/proxy.mjs"
   },
   "dependencies": {
     "@opentunnel/protocol": "workspace:*"
   },
   "peerDependencies": {
-    "effect": "^4.0.0"
+    "effect": "^4.0.0",
+    "undici": ">=7.0.0"
+  },
+  "peerDependenciesMeta": {
+    "undici": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@peculiar/x509": "catalog:",
@@ -50,6 +56,7 @@
     "@typescript/native-preview": "catalog:",
     "effect": "catalog:",
     "reflect-metadata": "catalog:",
-    "typescript": "catalog:"
+    "typescript": "catalog:",
+    "undici": "catalog:"
   }
 }

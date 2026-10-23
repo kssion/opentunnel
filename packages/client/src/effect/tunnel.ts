@@ -6,13 +6,8 @@ import { BridgeProtocol } from "@opentunnel/protocol/bridge-protocol";
 import { Names } from "@opentunnel/protocol/names";
 import { ProxyProtocol } from "@opentunnel/protocol/proxy-protocol";
 import { USER_AGENT } from "./api.js";
+import { makeTransport, type Transport } from "./proxy.js";
 import { isValidRouteName, publicUrls } from "./routes.js";
-
-/** Bun's WebSocket also takes options with request headers, which the DOM typings don't know about. */
-const BunWebSocket = WebSocket as unknown as new (
-  url: URL,
-  options: { readonly protocols: string[]; readonly headers: Record<string, string> },
-) => WebSocket;
 import type {
   OpenTunnelClientEvent,
   OpenTunnelIdentity,
@@ -131,6 +126,8 @@ export interface TunnelOptions {
   readonly onRenewed?: (identity: OpenTunnelIdentity) => void;
   /** `"fail"` makes `route_conflict` fatal instead of retrying it. */
   readonly onRouteConflict?: "retry" | "fail";
+  /** How to reach the API and the bridge; defaults to the runtime's, with the environment's proxy. */
+  readonly transport?: Transport;
 }
 
 /**
@@ -144,6 +141,7 @@ export class Tunnel {
   private secureContext: Tls.SecureContext;
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly refreshAbort = new AbortController();
+  private readonly transport: Transport;
   private session: Session | undefined;
   private shutdown = false;
   private wake: (() => void) | undefined;
@@ -155,6 +153,7 @@ export class Tunnel {
 
   constructor(private readonly options: TunnelOptions) {
     this.resolved = resolveRoutes(options.routes);
+    this.transport = options.transport ?? makeTransport();
     this.routes = { ...options.routes };
     this.identity = options.identity;
     this.secureContext = secureContextFor(options.identity);
@@ -192,7 +191,7 @@ export class Tunnel {
         `/api/tunnel/${encodeURIComponent(this.identity.id)}/certificate`,
         this.options.api,
       );
-      const response = await fetch(url, {
+      const response = await (this.transport.fetch ?? fetch)(url, {
         headers: { authorization: `Bearer ${this.identity.token}` },
         signal: this.refreshAbort.signal,
       });
@@ -290,7 +289,7 @@ export class Tunnel {
         }
         this.status.state = "connecting";
         this.emit({ type: "connecting", attempt });
-        const session = new Session(this.options, this.routes, () => this.secureContext, {
+        const session = new Session(this.options, this.transport, this.routes, () => this.secureContext, {
           emit: (event) => this.emit(event),
           route: (route) => this.resolved.get(route),
           attached: (sessionID) => {
@@ -357,6 +356,7 @@ class Session {
 
   constructor(
     private readonly options: TunnelOptions,
+    private readonly transport: Transport,
     private readonly routes: OpenTunnelRoutes,
     private readonly secureContext: () => Tls.SecureContext,
     private readonly hooks: SessionHooks,
@@ -370,10 +370,16 @@ class Session {
         this.options.api,
       );
       url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-      const socket = new BunWebSocket(url, {
-        protocols: [BridgeProtocol.WEBSOCKET_SUBPROTOCOL],
-        headers: { "user-agent": USER_AGENT },
-      });
+      let socket: WebSocket;
+      try {
+        socket = this.transport.webSocket(url, [BridgeProtocol.WEBSOCKET_SUBPROTOCOL], {
+          "user-agent": USER_AGENT,
+        });
+      } catch (error) {
+        // The environment selects a proxy the bridge cannot use; retrying will not help.
+        this.end({ type: "fatal", error: error instanceof Error ? error : new Error(String(error)) });
+        return;
+      }
       socket.binaryType = "arraybuffer";
       this.socket = socket;
       this.attachTimeout = setTimeout(

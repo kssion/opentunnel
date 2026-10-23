@@ -242,7 +242,7 @@ fn now_ms() -> u64 {
 }
 
 /// A failed bridge upgrade, with the HTTP status and what Cloudflare means by it.
-fn connect_error(error: tokio_tungstenite::tungstenite::Error) -> Error {
+pub(crate) fn connect_error(error: tokio_tungstenite::tungstenite::Error) -> Error {
     match error {
         tokio_tungstenite::tungstenite::Error::Http(response) => {
             let status = response.status().as_u16();
@@ -467,6 +467,8 @@ impl Supervisor {
                 Ok(Err(Error::Attach(code))) if codes::is_fatal_attach_error(&code) => {
                     return SessionEnd::Fatal(Error::Attach(code));
                 }
+                // The environment selects a proxy the bridge cannot use; retrying will not help.
+                Ok(Err(error @ Error::Invalid(_))) => return SessionEnd::Fatal(error),
                 Ok(Err(error)) => return SessionEnd::Retry { error: error.to_string(), attached: false },
                 Err(_) => return SessionEnd::Retry { error: "bridge attach timed out".into(), attached: false },
             },
@@ -693,9 +695,8 @@ impl Supervisor {
             "user-agent",
             HeaderValue::from_static(concat!("opentunnel/", env!("CARGO_PKG_VERSION"))),
         );
-        let mut socket = crate::tls::connect_websocket(request, self.api.trust())
-            .await
-            .map_err(connect_error)?;
+        let mut socket =
+            crate::tls::connect_websocket(request, self.api.trust(), self.api.proxies()).await?;
         socket
             .send(control(&ClientMessage::Attach {
                 token: self.identity.token.clone(),

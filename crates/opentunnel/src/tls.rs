@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
+use crate::http_proxy::{Io, Proxies};
 
 /// Environment variable naming a PEM file of extra CA certificates to trust.
 pub const CA_CERT_ENV: &str = "OPENTUNNEL_CA_CERT";
@@ -102,17 +103,24 @@ impl Trust {
 }
 
 pub(crate) type WebSocket =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<Box<dyn Io>>>;
 
-/// Opens a WebSocket that verifies `wss://` servers against `trust`.
+/// Opens a WebSocket that verifies `wss://` servers against `trust`,
+/// through the proxy `proxies` select for it.
 pub(crate) async fn connect_websocket(
-    request: impl IntoClientRequest + Unpin,
+    request: impl IntoClientRequest,
     trust: &Trust,
-) -> std::result::Result<WebSocket, tokio_tungstenite::tungstenite::Error> {
+    proxies: &Proxies,
+) -> Result<WebSocket> {
+    let request = request
+        .into_client_request()
+        .map_err(|error| Error::Bridge(error.to_string()))?;
+    let stream = crate::http_proxy::open(request.uri(), proxies, trust).await?;
     let connector = tokio_tungstenite::Connector::Rustls(trust.websocket.clone());
-    tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
+    tokio_tungstenite::client_async_tls_with_config(request, stream, None, Some(connector))
         .await
         .map(|(socket, _)| socket)
+        .map_err(crate::tunnel::connect_error)
 }
 
 #[cfg(test)]
@@ -131,7 +139,7 @@ pub(crate) mod tests {
     pub struct Authority {
         pub ca_pem: String,
         pub ca_der: CertificateDer<'static>,
-        server: Arc<rustls::ServerConfig>,
+        pub server: Arc<rustls::ServerConfig>,
     }
 
     impl Authority {
@@ -229,8 +237,14 @@ pub(crate) mod tests {
         let api = Api::with_trust(http.clone(), trust.clone());
         let http_ok = api.http.get(http.clone()).send().await.is_ok();
         let url = Api::with_trust(websocket.clone(), trust.clone()).connect_url("demo");
-        let websocket_ok = connect_websocket(url.as_str(), &trust).await.is_ok();
+        let websocket_ok = connect_websocket(url.as_str(), &trust, &no_proxies())
+            .await
+            .is_ok();
         (http_ok, websocket_ok)
+    }
+
+    pub fn no_proxies() -> Proxies {
+        Proxies::new(hyper_util::client::proxy::matcher::Matcher::builder().build())
     }
 
     fn native(certs: Vec<CertificateDer<'static>>) -> rustls_native_certs::CertificateResult {

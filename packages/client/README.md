@@ -111,6 +111,12 @@ See `docs/trust-boundary.md` in the repository for what a target can trust.
 ## API
 
 ```ts
+function create(options?: {
+  api?: string | URL // defaults to https://opentunnel.xyz
+  store?: Storage
+  proxy?: string // see "HTTP proxies"
+}): Client
+
 interface Client {
   profile: { list(): Promise<string[]> }
   tunnel: {
@@ -191,6 +197,42 @@ the tunnel's control traffic and take its token.
 The Rust client and CLI use the OS store automatically and also read
 `OPENTUNNEL_CA_CERT`. Either way this only concerns the connection to
 `opentunnel.xyz`; visitor traffic is still decrypted only in your process.
+
+### HTTP proxies
+
+The bridge WebSocket goes through the same proxy as the API calls:
+`HTTPS_PROXY` for `wss://` (the default API is `https://`), `HTTP_PROXY` for
+`ws://`, then `ALL_PROXY`, each upper case first, and nothing for hosts in
+`NO_PROXY` (comma separated: `*`, domains that also cover their subdomains,
+with or without a leading `.`, IP addresses or CIDR ranges, each optionally
+with `:port`). A proxy URL without a scheme is taken as `http://`, and
+credentials go in its userinfo (`http://user:pass@proxy:3128`).
+
+- Bun: its `fetch` reads these variables, its `WebSocket` does not, so the SDK
+  resolves the proxy for the bridge itself and passes it to the WebSocket.
+  Bun's `fetch` ignores `ALL_PROXY`; the bridge honors it.
+- Node: `fetch` and `WebSocket` both ignore these variables unless you run
+  with `NODE_USE_ENV_PROXY=1` (Node 22.21+ and 24+) or `--use-env-proxy`
+  (22.21+ and 24.5+), which makes both use `HTTPS_PROXY`, `HTTP_PROXY` and
+  `NO_PROXY` (not `ALL_PROXY`), so the bridge always follows the API.
+- Deno: `fetch` and `WebSocket` both honor them.
+
+Only `http://` and `https://` proxies are supported. A SOCKS proxy (such as
+`ALL_PROXY=socks5://…`) stops the tunnel with an error naming the variable
+instead of connecting around it; Bun's `fetch` fails on one as well.
+
+To use a proxy regardless of the environment, pass it to `create` (or
+`OpenTunnelClient.layer`); it is used for the API and the bridge, and `create`
+throws an `OpenTunnelClientError` if it is not an `http://` or `https://` URL:
+
+```ts
+const client = create({ proxy: "http://user:pass@proxy.corp:3128" })
+```
+
+On Node the `proxy` option needs the [`undici`](https://www.npmjs.com/package/undici)
+package (an optional peer dependency, version 7 or later) installed next to the
+SDK. Bun's `fetch` still applies `NO_PROXY` to API calls made through it; the
+bridge does not.
 
 ## Backpressure
 

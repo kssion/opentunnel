@@ -48,7 +48,9 @@ proxy's CA when it is installed in the OS trust store; nothing to configure.
 `SSL_CERT_FILE` and `SSL_CERT_DIR` are honored. To trust a specific CA instead,
 pass `--ca-cert <path>` or set `OPENTUNNEL_CA_CERT` to a PEM file with one or
 more certificates. This only concerns the connection to `opentunnel.xyz`;
-visitor traffic is still decrypted only on your machine. See
+visitor traffic is still decrypted only on your machine. An HTTP proxy in
+`HTTPS_PROXY` (or `ALL_PROXY`, minus `NO_PROXY`) carries both the API calls
+and the bridge. See
 [packages/cli](packages/cli#corporate-proxies--custom-cas) and, for the SDK,
 [packages/client](packages/client#corporate-proxies--custom-cas).
 

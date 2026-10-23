@@ -27,7 +27,8 @@
       "bumpp": "11.0.1",
       "effect": "4.0.2",
       "reflect-metadata": "0.2.2",
-      "typescript": "6.0.2"
+      "typescript": "6.0.2",
+      "undici": "8.12.3"
     }
   },
   "devDependencies": {

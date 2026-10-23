@@ -18,6 +18,7 @@ import type {
   OpenTunnelProgressOptions,
   OpenTunnelProvisionStage,
 } from "./types.js";
+import { makeTransport } from "./proxy.js";
 import { OpenTunnelAttachError, Tunnel as RunningTunnel, validateRoutes } from "./tunnel.js";
 
 const profileName = (options?: OpenTunnelProfileOptions) => options?.profile ?? "default";
@@ -68,7 +69,22 @@ const privateKeyPem = (buffer: ArrayBuffer): string => {
 export interface OpenTunnelClientOptions {
   readonly api?: URL | string;
   readonly storage?: Storage;
+  /**
+   * An `http://` or `https://` proxy URL (credentials as userinfo) for the API
+   * and the bridge, instead of the one `HTTPS_PROXY`, `HTTP_PROXY`,
+   * `ALL_PROXY` and `NO_PROXY` select. On Node it needs the `undici` package.
+   * `layer` throws an `OpenTunnelClientError` when the proxy cannot be used.
+   */
+  readonly proxy?: string;
 }
+
+const transportFor = (proxy: string | undefined) => {
+  try {
+    return makeTransport(proxy);
+  } catch (cause) {
+    throw new OpenTunnelClientError({ message: cause instanceof Error ? cause.message : String(cause), cause });
+  }
+};
 
 export class OpenTunnelClient extends Context.Service<
   OpenTunnelClient,
@@ -76,6 +92,7 @@ export class OpenTunnelClient extends Context.Service<
 >()("@opentunnel/client/OpenTunnelClient") {
   static layer(options: OpenTunnelClientOptions = {}) {
     const storage = options.storage ?? OpenTunnelStorage.xdg();
+    const transport = transportFor(options.proxy);
     return Layer.effect(
       OpenTunnelClient,
       Effect.gen(function* () {
@@ -312,6 +329,7 @@ export class OpenTunnelClient extends Context.Service<
                     identity,
                     routes: input.routes,
                     onRouteConflict: input.onRouteConflict,
+                    transport,
                     onEvent: (event) => {
                       input.onEvent?.(event);
                       Queue.offerUnsafe(events, event);
@@ -355,7 +373,12 @@ export class OpenTunnelClient extends Context.Service<
         return client;
       }),
     ).pipe(
-      Layer.provide(OpenTunnelApiClient.layer({ api: options.api ?? "https://opentunnel.xyz" })),
+      Layer.provide(
+        OpenTunnelApiClient.layer({
+          api: options.api ?? "https://opentunnel.xyz",
+          ...(transport.fetch ? { fetch: transport.fetch } : {}),
+        }),
+      ),
     );
   }
 }

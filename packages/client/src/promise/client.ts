@@ -21,6 +21,13 @@ import { toEffectStorage, type OpenTunnelStorage } from "./storage.js";
 export interface OpenTunnelClientOptions {
   readonly api?: URL | string;
   readonly store?: OpenTunnelStorage;
+  /**
+   * An `http://` or `https://` proxy URL (credentials as userinfo) for the API
+   * and the bridge, instead of the one `HTTPS_PROXY`, `HTTP_PROXY`,
+   * `ALL_PROXY` and `NO_PROXY` select. On Node it needs the `undici` package.
+   * `create` throws an `OpenTunnelClientError` when the proxy cannot be used.
+   */
+  readonly proxy?: string;
 }
 
 export interface OpenTunnelConnection {
@@ -83,6 +90,7 @@ export interface OpenTunnelPromiseClient {
 export function create(options: OpenTunnelClientOptions = {}): OpenTunnelPromiseClient {
   const effectOptions: EffectClientOptions = {
     api: options.api,
+    ...(options.proxy === undefined ? {} : { proxy: options.proxy }),
     ...(options.store ? { storage: toEffectStorage(options.store) } : {}),
   };
   const runtime = ManagedRuntime.make(OpenTunnelClient.layer(effectOptions));

@@ -30,3 +30,10 @@ The API and bridge connections trust the bundled Mozilla roots, the OS trust
 store (`SSL_CERT_FILE` and `SSL_CERT_DIR` are honored), and the PEM file in
 `ClientOptions::ca_cert` or `OPENTUNNEL_CA_CERT`, so the client works behind
 TLS-inspecting corporate proxies. Unreadable OS certificates are skipped.
+
+Both connections also go through the HTTP proxy the environment names, chosen
+by the same rules (reqwest's): `HTTPS_PROXY` for an `https://` API and its
+`wss://` bridge, `HTTP_PROXY` for `http://` and `ws://`, then `ALL_PROXY`,
+except for hosts in `NO_PROXY`. The bridge supports `http://` and `https://`
+proxies, with basic auth from the URL's credentials; a SOCKS proxy stops the
+tunnel with an error.

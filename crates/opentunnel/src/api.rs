@@ -8,6 +8,7 @@ use reqwest::{Method, RequestBuilder, Response, Url};
 use tracing::debug;
 
 use crate::error::{Error, Result};
+use crate::http_proxy::Proxies;
 use crate::tls::Trust;
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,7 @@ pub struct Api {
     base: Url,
     pub(crate) http: reqwest::Client,
     trust: Trust,
+    proxies: Proxies,
     /// Divides the retry delays, so tests need not wait for them.
     pub(crate) retry_scale: u64,
 }
@@ -36,6 +38,7 @@ impl Api {
             base,
             http,
             trust,
+            proxies: Proxies::from_env(),
             retry_scale: 1,
         }
     }
@@ -43,6 +46,11 @@ impl Api {
     /// TLS settings for the bridge WebSocket, sharing the API's roots.
     pub(crate) fn trust(&self) -> &Trust {
         &self.trust
+    }
+
+    /// The proxies for the bridge WebSocket, chosen like the API's.
+    pub(crate) fn proxies(&self) -> &Proxies {
+        &self.proxies
     }
 
     pub fn base(&self) -> &Url {

@@ -15,6 +15,7 @@
 pub mod api;
 mod client;
 mod error;
+mod http_proxy;
 mod identity;
 pub mod paths;
 mod provision;

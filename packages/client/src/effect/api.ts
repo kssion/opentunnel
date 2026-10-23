@@ -78,7 +78,8 @@ interface OpenTunnelApi {
 export class OpenTunnelApiClient extends Context.Service<OpenTunnelApiClient, OpenTunnelApi>()(
   "@opentunnel/client/OpenTunnelApiClient",
 ) {
-  static layer(options: { readonly api: URL | string }) {
+  /** `fetch` replaces the runtime's for API calls, as a proxy needs on some runtimes. */
+  static layer(options: { readonly api: URL | string; readonly fetch?: typeof globalThis.fetch }) {
     return Layer.effect(
       OpenTunnelApiClient,
       Effect.gen(function* () {
@@ -101,6 +102,12 @@ export class OpenTunnelApiClient extends Context.Service<OpenTunnelApiClient, Op
             }),
         };
       }),
-    ).pipe(Layer.provide(FetchHttpClient.layer));
+    ).pipe(
+      Layer.provide(
+        options.fetch
+          ? FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch, options.fetch)))
+          : FetchHttpClient.layer,
+      ),
+    );
   }
 }

@@ -80,6 +80,29 @@ not passed to a systemd or launchd service; use `--ca-cert` for those. Visitor
 traffic is unaffected: it is still decrypted only on your machine with the
 tunnel's own certificate.
 
+### HTTP proxies
+
+The API calls and the bridge WebSocket go through the proxy the environment
+names, chosen the same way for both: `HTTPS_PROXY` (the default API is
+`https://`), `HTTP_PROXY` for an `http://` API, then `ALL_PROXY`, and nothing
+for hosts in `NO_PROXY` (comma separated domains, which also cover their
+subdomains, IP addresses or CIDR ranges, or `*`). Upper and lower case names
+both work; a proxy URL without a scheme is taken as `http://`.
+
+```bash
+HTTPS_PROXY=http://user:pass@proxy.corp:3128 opentunnel up
+```
+
+`http://` and `https://` proxies are supported, with credentials in the URL
+(sent as basic auth). A SOCKS proxy stops the tunnel with an error instead of
+connecting around it.
+
+A systemd or launchd service does not inherit your shell's variables. For
+systemd, put them in `~/.config/environment.d/proxy.conf` (or run
+`systemctl --user set-environment HTTPS_PROXY=…`); for launchd, run
+`launchctl setenv HTTPS_PROXY …`. Then restart the service with
+`opentunnel down && opentunnel up`.
+
 ## Files
 
 Configuration is declarative, contains no credentials, and is safe to commit to
