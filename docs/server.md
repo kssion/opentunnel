@@ -845,10 +845,19 @@ attach, ~0.15 ms per visitor connection. On a dedicated core memory binds
 first; on `shared-cpu-1x` the storm a machine must absorb on a starved core
 does (it should stay at a few thousand bridges).
 
-| Machine | Bridges at ~60% memory | Recommended `soft_limit` / `hard_limit` (connections on :443) |
-| --- | --- | --- |
-| `shared-cpu-1x`, 1 GB (`fly.toml` today) | ~12,000 | 5,000 / 10,000 |
-| `performance-1x`, 2 GB | ~24,000 | 15,000 / 25,000 |
+**Production correction (2026-10-25).** Real bridges are not idle: their visitors, scanner probes for
+offline tunnels, reconnects and API handshakes cost far more than the load test's idle bridges. Measured in
+production, a machine's own CPU work is roughly 0.7-1% of a core per 100 bridges (fra: 7.4% at 2,015; cdg:
+~6% at ~680, with heavier traffic per bridge). A `shared-cpu-1x` is only guaranteed 1/16 of a core (6.25%)
+and runs on burst credit above that, so the CPU baseline, not memory, binds first: at **~700-1,000 bridges**
+a machine sits at its baseline and slowly drains its credit, and at 0 credit Fly throttles it (the time shows
+up as `steal` in `fly_instance_cpu`). Scale out a region when a machine's `fly_instance_cpu_balance` trends
+down or its bridges pass ~800.
+
+| Machine | Bridges at ~60% memory | Bridges at CPU baseline (production) | `soft_limit` / `hard_limit` (connections on :443) |
+| --- | --- | --- | --- |
+| `shared-cpu-1x`, 1 GB (`fly.toml` today) | ~12,000 | ~700-1,000 | 1,000 / 10,000 |
+| `performance-1x`, 2 GB | ~24,000 | ~10,000+ (dedicated core) | 15,000 / 25,000 |
 
 The limits count every connection on :443 (bridges, visitors, API calls).
 Fly's proxy sends a new connection to the closest machine in the region that

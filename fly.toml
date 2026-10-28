@@ -74,11 +74,13 @@ kill_timeout = "30s"
   # Bridges plus visitors and API calls, sized for shared-cpu-1x with 1 GB: a bridge costs ~50 KB in production,
   # and a storm of 10,000 reconnecting at once takes over a minute on a shared core whose burst balance is gone.
   # Past soft_limit the proxy prefers the region's other machines, if any (soft limits never leave the region;
-  # only when every machine there is at hard_limit do new connections go to another region). performance-1x
-  # with 2 GB: 15000 / 25000. See docs/server.md, "Capacity".
+  # only when every machine there is at hard_limit do new connections go to another region). In production a
+  # shared-cpu-1x reaches its CPU baseline (1/16 core) at roughly 700-1000 bridges, so the soft limit spreads a
+  # region's connections across its machines well before that; the hard limit stays high so nothing is refused.
+  # See docs/server.md, "Capacity".
   [services.concurrency]
     type = "connections"
-    soft_limit = 5000
+    soft_limit = 1000
     hard_limit = 10000
 
   [[services.tcp_checks]]
